@@ -1,0 +1,168 @@
+from flask import Flask, Response, abort
+import threading
+import time
+import cv2
+
+app = Flask(__name__)
+
+# Hardcoded MJPEG camera URLs and their corresponding ports
+CAMERA_CONFIG = {
+    "hallCam": {"url": "http://192.168.1.154:8082", "stream_port": 4999,},
+    "KitchenCam": {"url": "http://192.168.1.98:8085", "stream_port": 4999},
+}
+
+# Global dictionary to manage camera streams
+camera_streams = {}
+
+class MJPEGStream:
+    def __init__(self, camera_url):
+        self.camera_url = camera_url
+        self.frame = None
+        self.connected = False
+        self.lock = threading.Lock()
+        self.running = True
+        self.clients = 0  # Track the number of connected clients
+        self.thread = None  # Thread will be started dynamically
+        print(f"[INFO] MJPEGStream initialized for camera: {self.camera_url}")
+
+    def _update_stream(self):
+        while self.running:
+            try:
+                print(f"[DEBUG] Attempting to connect to camera: {self.camera_url}")
+                cap = cv2.VideoCapture(self.camera_url)
+                if not cap.isOpened():
+                    print(f"[ERROR] Failed to connect to camera: {self.camera_url}")
+                    self.connected = False
+                    time.sleep(1)
+                    continue
+
+                print(f"[INFO] Connected to camera: {self.camera_url}")
+                self.connected = True
+                while self.running and self.clients > 0:
+                    ret, frame = cap.read()
+                    if not ret:
+                        print(f"[ERROR] Failed to read frame from camera: {self.camera_url}")
+                        self.connected = False
+                        break
+
+                    with self.lock:
+                        _, encoded_frame = cv2.imencode('.jpg', frame)
+                        self.frame = encoded_frame.tobytes()
+
+                cap.release()
+                print(f"[INFO] Disconnected from camera: {self.camera_url}")
+                self.connected = False
+
+            except Exception as e:
+                print(f"[ERROR] Exception in camera stream {self.camera_url}: {e}")
+                self.connected = False
+                time.sleep(1)
+
+    def start_stream(self):
+        if self.thread is None or not self.thread.is_alive():
+            print(f"[INFO] Starting stream for camera: {self.camera_url}")
+            self.running = True
+            self.thread = threading.Thread(target=self._update_stream, daemon=True)
+            self.thread.start()
+
+    def stop_stream(self):
+        print(f"[INFO] Stopping stream for camera: {self.camera_url}")
+        self.running = False
+        if self.thread is not None:
+            self.thread.join()
+            self.thread = None
+
+    def get_frame(self):
+        with self.lock:
+            return self.frame
+
+# Route to handle the MJPEG stream
+@app.route('/camera/<camera_id>')
+def camera_stream(camera_id):
+    if camera_id not in CAMERA_CONFIG:
+        print(f"[ERROR] Camera ID {camera_id} not found in config")
+        abort(404, "Camera not found in config")
+
+    if camera_id not in camera_streams:
+        print(f"[INFO] Initializing stream for camera ID: {camera_id}")
+        camera_streams[camera_id] = MJPEGStream(CAMERA_CONFIG[camera_id]["url"])
+
+    camera = camera_streams[camera_id]
+    camera.clients += 1
+    print(f"[INFO] Client connected to camera ID: {camera_id}. Total clients: {camera.clients}")
+    camera.start_stream()
+    time.sleep(1)
+
+    def generate():
+        try:
+            while True:
+                if not camera.connected:
+                    print(f"[ERROR] Camera ID {camera_id} not connected")
+                    abort(404, "Camera not connected")
+                frame = camera.get_frame()
+                if frame is not None:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                else:
+                    time.sleep(0.1)
+        finally:
+            camera.clients -= 1
+            print(f"[INFO] Client disconnected from camera ID: {camera_id}. Total clients: {camera.clients}")
+            if camera.clients == 0:
+                camera.stop_stream()
+
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# Route to handle snapshot requests
+@app.route('/snapshot/<camera_id>')
+def snapshot(camera_id):
+    print ("Snapshot request")
+    if camera_id not in CAMERA_CONFIG:
+        abort(404 , "Camera not found in config for snapshots")
+
+    if camera_id not in camera_streams:
+        # Initialize the camera stream if not already started
+        camera_streams[camera_id] = MJPEGStream(CAMERA_CONFIG[camera_id]["url"])
+        print ("Camera stream started")
+        print (CAMERA_CONFIG[camera_id]["url"])
+        time.sleep(1)
+
+    camera = camera_streams[camera_id]
+
+    if not camera.connected:
+        print (CAMERA_CONFIG[camera_id]["url"])
+        print ("Camera not connected")
+        abort(404, "Camera not connected")
+        
+
+    frame = camera.get_frame()
+    if frame is None:
+        abort(404, "Failed to get frame")
+
+    return Response(frame, mimetype='image/jpeg')
+
+if __name__ == '__main__':
+    # Start Flask servers for each camera on its assigned ports
+    threads = []
+    for camera_id, config in CAMERA_CONFIG.items():
+        def run_server(camera_id, _port):
+            app_stream = Flask(__name__)
+
+            @app_stream.route('/camera/<camera_id>')
+            def camera_stream_route(camera_id=camera_id):
+                return camera_stream(camera_id)
+            @app_stream.route('/snapshot/<camera_id>')
+            def snapshot_route(camera_id=camera_id):
+                return snapshot(camera_id)
+            print ("Stream added at port ", _port)
+            print("Snapshot added at camera_id  ", camera_id)
+            app_stream.run(host='0.0.0.0', port=_port, threaded=True, use_reloader=False)
+            
+        thread = threading.Thread(target=run_server, args=(camera_id, config["stream_port"]), daemon=True)
+        threads.append(thread)
+        thread.start()
+        
+
+    # Keep the main thread alive
+    for thread in threads:
+        thread.join()
