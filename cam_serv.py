@@ -7,8 +7,9 @@ app = Flask(__name__)
 
 # Hardcoded MJPEG camera URLs and their corresponding ports
 CAMERA_CONFIG = {
-    "hallCam": {"url": "http://192.168.1.154:8082", "stream_port": 4999,},
-    "KitchenCam": {"url": "http://192.168.1.98:8085", "stream_port": 4999},
+    "hallcam": {"url": "http://192.168.1.154:8082", "stream_port": 4999,},
+    "kitchencam": {"url": "http://192.168.1.98:8085", "stream_port": 4999},
+    "livingroom": {"url": "http://192.168.1.81:8085", "stream_port": 4999},
 }
 
 # Global dictionary to manage camera streams
@@ -23,6 +24,9 @@ class MJPEGStream:
         self.running = True
         self.clients = 0  # Track the number of connected clients
         self.thread = None  # Thread will be started dynamically
+        self.fps = 0
+        self.last_frame_time = time.perf_counter()
+        
         print(f"[INFO] MJPEGStream initialized for camera: {self.camera_url}")
 
     def _update_stream(self):
@@ -33,7 +37,7 @@ class MJPEGStream:
                 if not cap.isOpened():
                     print(f"[ERROR] Failed to connect to camera: {self.camera_url}")
                     self.connected = False
-                    time.sleep(1)
+                    time.sleep(0.1)
                     continue
 
                 print(f"[INFO] Connected to camera: {self.camera_url}")
@@ -56,7 +60,6 @@ class MJPEGStream:
             except Exception as e:
                 print(f"[ERROR] Exception in camera stream {self.camera_url}: {e}")
                 self.connected = False
-                time.sleep(1)
 
     def start_stream(self):
         if self.thread is None or not self.thread.is_alive():
@@ -79,9 +82,10 @@ class MJPEGStream:
 # Route to handle the MJPEG stream
 @app.route('/camera/<camera_id>')
 def camera_stream(camera_id):
+    camera_id = camera_id.lower()
     if camera_id not in CAMERA_CONFIG:
         print(f"[ERROR] Camera ID {camera_id} not found in config")
-        abort(404, "Camera not found in config")
+        abort(404, f"Camera  {camera_id}  not found in config")
 
     if camera_id not in camera_streams:
         print(f"[INFO] Initializing stream for camera ID: {camera_id}")
@@ -91,20 +95,28 @@ def camera_stream(camera_id):
     camera.clients += 1
     print(f"[INFO] Client connected to camera ID: {camera_id}. Total clients: {camera.clients}")
     camera.start_stream()
-    time.sleep(1)
 
     def generate():
+        retry = 0 
         try:
             while True:
                 if not camera.connected:
                     print(f"[ERROR] Camera ID {camera_id} not connected")
-                    abort(404, "Camera not connected")
+                    if retry < 15:
+                        retry += 1
+                        time.sleep(0.2)
+                    else:
+                        abort(404, "Camera not connected")
                 frame = camera.get_frame()
                 if frame is not None:
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                else:
-                    time.sleep(0.1)
+                    # calculate fps
+                if camera.frame is not None:
+                    camera.fps = 1 / (time.perf_counter() - camera.last_frame_time)
+                    camera.last_frame_time = time.perf_counter()
+                #print (f"[INFO] FPS: {camera.fps:.2f}") 
+                time.sleep(0.06)  # Adjust the sleep time as needed
         finally:
             camera.clients -= 1
             print(f"[INFO] Client disconnected from camera ID: {camera_id}. Total clients: {camera.clients}")
@@ -117,6 +129,7 @@ def camera_stream(camera_id):
 @app.route('/snapshot/<camera_id>')
 def snapshot(camera_id):
     print ("Snapshot request")
+    camera_id = camera_id.lower()
     if camera_id not in CAMERA_CONFIG:
         abort(404 , "Camera not found in config for snapshots")
 
@@ -125,15 +138,19 @@ def snapshot(camera_id):
         camera_streams[camera_id] = MJPEGStream(CAMERA_CONFIG[camera_id]["url"])
         print ("Camera stream started")
         print (CAMERA_CONFIG[camera_id]["url"])
-        time.sleep(1)
+        
 
     camera = camera_streams[camera_id]
 
     if not camera.connected:
         print (CAMERA_CONFIG[camera_id]["url"])
         print ("Camera not connected")
-        abort(404, "Camera not connected")
-        
+        retry = 0
+        if retry < 15:
+            retry += 1
+            time.sleep(0.2)
+        else:
+            abort(404, "Camera not connected")
 
     frame = camera.get_frame()
     if frame is None:
