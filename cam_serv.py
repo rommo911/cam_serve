@@ -7,7 +7,7 @@ app = Flask(__name__)
 
 # Hardcoded MJPEG camera URLs and their corresponding ports
 CAMERA_CONFIG = {
-    "hallcam": {"url": "http://192.168.1.154:8082", "stream_port": 4999,},
+    "hallcam": {"url": "http://192.168.1.154:8085", "stream_port": 4999,},
     "kitchencam": {"url": "http://192.168.1.98:8085", "stream_port": 4999},
     "livingroom": {"url": "http://192.168.1.81:8085", "stream_port": 4999},
 }
@@ -21,7 +21,7 @@ class MJPEGStream:
         self.frame = None
         self.connected = False
         self.lock = threading.Lock()
-        self.running = True
+        self.running = False
         self.clients = 0  # Track the number of connected clients
         self.thread = None  # Thread will be started dynamically
         self.fps = 0
@@ -34,15 +34,23 @@ class MJPEGStream:
             try:
                 print(f"[DEBUG] Attempting to connect to camera: {self.camera_url}")
                 cap = cv2.VideoCapture(self.camera_url)
+                retry = 0
                 if not cap.isOpened():
-                    print(f"[ERROR] Failed to connect to camera: {self.camera_url}")
-                    self.connected = False
-                    time.sleep(0.1)
+                    if retry < 15:
+                        retry += 1
+                        time.sleep(0.2)
                     continue
-
-                print(f"[INFO] Connected to camera: {self.camera_url}")
+                if cap.isOpened():
+                    print(f"[INFO] Camera connected: {self.camera_url}")
+                    
+                else:
+                    print(f"[ERROR] Camera not connected: {self.camera_url}")
+                    self.connected = False
+                    self.isStreaming = False
+                    break
                 self.connected = True
-                while self.running and self.clients > 0:
+                noclientsThrottle = 25
+                while self.running:
                     ret, frame = cap.read()
                     if not ret:
                         print(f"[ERROR] Failed to read frame from camera: {self.camera_url}")
@@ -52,13 +60,22 @@ class MJPEGStream:
                     with self.lock:
                         _, encoded_frame = cv2.imencode('.jpg', frame)
                         self.frame = encoded_frame.tobytes()
+                        self.last_frame_time = time.perf_counter()
+                    if self.clients == 0:
+                        noclientsThrottle -= 1
+                        if noclientsThrottle <= 0:
+                            print(f"[INFO] No clients connected, stopping stream for camera: {self.camera_url}")
+                            self.connected = False
+                            self.isStreaming = False
+                            self.running = False
+                            break
 
                 cap.release()
-                print(f"[INFO] Disconnected from camera: {self.camera_url}")
+                print(f"[INFO] Disconnected from camera: {self.camera_url} , client count: {self.clients}")
                 self.connected = False
 
             except Exception as e:
-                print(f"[ERROR] Exception in camera stream {self.camera_url}: {e}")
+                print(f"[ERROR] Exception in camera stream {self.camera_url}: {e} clients count {self.clients}")
                 self.connected = False
 
     def start_stream(self):
@@ -93,11 +110,12 @@ def camera_stream(camera_id):
 
     camera = camera_streams[camera_id]
     camera.clients += 1
-    print(f"[INFO] Client connected to camera ID: {camera_id}. Total clients: {camera.clients}")
-    camera.start_stream()
+    if not camera.running:
+        camera.start_stream()
+        print(f"[INFO] Starting stream for camera: {camera_id} for snapshot.......")
 
     def generate():
-        retry = 0 
+        retry = 0
         try:
             while True:
                 if not camera.connected:
@@ -131,29 +149,34 @@ def snapshot(camera_id):
     print ("Snapshot request")
     camera_id = camera_id.lower()
     if camera_id not in CAMERA_CONFIG:
+        print(f"[ERROR] Camera ID {camera_id} not found in config for snapshots")
         abort(404 , "Camera not found in config for snapshots")
 
     if camera_id not in camera_streams:
         # Initialize the camera stream if not already started
+        print(f"[INFO] Initializing stream for camera ID: {camera_id} for snapshot")
         camera_streams[camera_id] = MJPEGStream(CAMERA_CONFIG[camera_id]["url"])
-        print ("Camera stream started")
-        print (CAMERA_CONFIG[camera_id]["url"])
-        
 
     camera = camera_streams[camera_id]
-
-    if not camera.connected:
-        print (CAMERA_CONFIG[camera_id]["url"])
-        print ("Camera not connected")
+    if not camera.running:
+        print(f"[INFO] Starting stream for camera: {camera_id} for snapshot.......")
+        camera.start_stream()
+        time.sleep(0.2)
+    print(f"handling snapshot")
+    print (CAMERA_CONFIG[camera_id]["url"])
+    while not camera.connected:
         retry = 0
         if retry < 15:
             retry += 1
             time.sleep(0.2)
         else:
+            print(f"[ERROR] Camera ID {camera_id} not connected for snapshot")
             abort(404, "Camera not connected")
-
+            break
+    print ("Camera connected")
     frame = camera.get_frame()
     if frame is None:
+        print(f"[ERROR] Failed to get frame from camera ID: {camera_id} for snapshot")
         abort(404, "Failed to get frame")
 
     return Response(frame, mimetype='image/jpeg')
