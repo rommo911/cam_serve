@@ -21,12 +21,13 @@ class MJPEGStream:
         self.frame = None
         self.connected = False
         self.lock = threading.Lock()
+        self.frame_condition = threading.Condition(self.lock)
         self.running = False
         self.clients = 0  # Track the number of connected clients
         self.thread = None  # Thread will be started dynamically
         self.fps = 0
         self.last_frame_time = time.perf_counter()
-        
+        self.frame_id = 0
         print(f"[INFO] MJPEGStream initialized for camera: {self.camera_url}")
 
     def _update_stream(self):
@@ -36,47 +37,47 @@ class MJPEGStream:
                 cap = cv2.VideoCapture(self.camera_url)
                 retry = 0
                 if not cap.isOpened():
-                    if retry < 15:
+                    if retry < 35:
                         retry += 1
                         time.sleep(0.2)
                     continue
                 if cap.isOpened():
                     print(f"[INFO] Camera connected: {self.camera_url}")
-                    
                 else:
                     print(f"[ERROR] Camera not connected: {self.camera_url}")
                     self.connected = False
-                    self.isStreaming = False
                     break
                 self.connected = True
-                noclientsThrottle = 25
+                noclientsThrottle = 45
+                last_frame_number = -1
                 while self.running:
-                    ret, frame = cap.read()
-                    if not ret:
-                        print(f"[ERROR] Failed to read frame from camera: {self.camera_url}")
-                        self.connected = False
-                        break
-
-                    with self.lock:
-                        _, encoded_frame = cv2.imencode('.jpg', frame)
-                        self.frame = encoded_frame.tobytes()
-                        self.last_frame_time = time.perf_counter()
+                    # Only grab a new frame if the stream has advanced
+                    if cap.grab():
+                        frame_number = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        if frame_number != last_frame_number:
+                            ret, frame = cap.retrieve()
+                            if not ret:
+                                print(f"[ERROR] Failed to read frame from camera: {self.camera_url}")
+                                continue
+                            with self.frame_condition:
+                                _, encoded_frame = cv2.imencode('.jpg', frame)
+                                self.frame = encoded_frame.tobytes()
+                                self.frame_id += 1
+                                self.last_frame_time = time.perf_counter()
+                                self.frame_condition.notify_all()
+                            last_frame_number = frame_number
                     if self.clients == 0:
                         noclientsThrottle -= 1
                         if noclientsThrottle <= 0:
                             print(f"[INFO] No clients connected, stopping stream for camera: {self.camera_url}")
-                            self.connected = False
-                            self.isStreaming = False
-                            self.running = False
                             break
-
                 cap.release()
                 print(f"[INFO] Disconnected from camera: {self.camera_url} , client count: {self.clients}")
-                self.connected = False
-
             except Exception as e:
                 print(f"[ERROR] Exception in camera stream {self.camera_url}: {e} clients count {self.clients}")
-                self.connected = False
+        self.connected = False
+        self.running = False
+        self.frame = None
 
     def start_stream(self):
         if self.thread is None or not self.thread.is_alive():
@@ -114,27 +115,29 @@ def camera_stream(camera_id):
         camera.start_stream()
         print(f"[INFO] Starting stream for camera: {camera_id} for snapshot.......")
 
+
     def generate():
         retry = 0
+        last_yielded_frame_id = -1
         try:
             while True:
-                if not camera.connected:
-                    print(f"[ERROR] Camera ID {camera_id} not connected")
-                    if retry < 15:
-                        retry += 1
-                        time.sleep(0.2)
-                    else:
-                        abort(404, "Camera not connected")
-                frame = camera.get_frame()
+                with camera.frame_condition:
+                    # Wait for a new frame or connection
+                    while (not camera.connected or camera.frame_id == last_yielded_frame_id):
+                        if not camera.connected:
+                            if retry < 20:
+                                retry += 1
+                                camera.frame_condition.wait(timeout=0.1)
+                                continue
+                            else:
+                                abort(404, "Camera not connected")
+                        else:
+                            camera.frame_condition.wait(timeout=0.1)
+                    frame = camera.frame
                 if frame is not None:
+                    last_yielded_frame_id = camera.frame_id
                     yield (b'--frame\r\n'
                            b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                    # calculate fps
-                if camera.frame is not None:
-                    camera.fps = 1 / (time.perf_counter() - camera.last_frame_time)
-                    camera.last_frame_time = time.perf_counter()
-                #print (f"[INFO] FPS: {camera.fps:.2f}") 
-                time.sleep(0.06)  # Adjust the sleep time as needed
         finally:
             camera.clients -= 1
             print(f"[INFO] Client disconnected from camera ID: {camera_id}. Total clients: {camera.clients}")
